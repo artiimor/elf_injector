@@ -8,10 +8,11 @@ It does **not** overwrite `.text`. It appends a new `PT_LOAD` and retargets
 `e_entry`.
 
 ```text
+make
 ./dummy_hello_world
 Hola mundo
 
-./elf_injector dummy_hello_world
+./injector dummy_hello_world
 ./new_elf_file
 >>> Codigo inyectado al arrancar
 Hola mundo
@@ -26,7 +27,7 @@ Works on `ET_EXEC` (`-no-pie`) and `ET_DYN` (PIE / default `gcc`).
 ELF = *Executable and Linkable Format*. `gcc` output is an ELF.
 
 ```bash
-gcc -g -Wall -Wextra -pedantic -O0 -o dummy_hello_world dummy_hello_world.c
+make dummy_hello_world
 ./dummy_hello_world
 ```
 
@@ -338,8 +339,8 @@ Not libc. No `printf`. Runs before `main`.
 ## 10. Quick check
 
 ```bash
-gcc -o dummy_hello_world dummy_hello_world.c
-./elf_injector dummy_hello_world
+make
+./injector dummy_hello_world
 readelf -h new_elf_file | grep Entry
 readelf -l new_elf_file          # extra LOAD R E, PHDR offset near EOF
 ./new_elf_file
