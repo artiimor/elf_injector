@@ -1,327 +1,346 @@
+
 # elf_injector
 
-Little tool to inject code in ELF files with educational purposes.
+Small educational tool: inject a stub into a Linux ELF64 (x86-64) so it
+runs **before** the original program, then jumps back to `_start`.
 
-## What do you need to understand
+It does **not** overwrite `.text`. It appends a new `PT_LOAD` and retargets
+`e_entry`.
 
-### What is an elf file?
+```text
+./dummy_hello_world
+Hola mundo
 
-An ELF file is an Executable and Linkable File. It's what you get when you compile a file.
-
-If you want to generate our example ELF file just run
+./elf_injector dummy_hello_world
+./new_elf_file
+>>> Codigo inyectado al arrancar
+Hola mundo
 ```
+
+Works on `ET_EXEC` (`-no-pie`) and `ET_DYN` (PIE / default `gcc`).
+
+---
+
+## 1. What is an ELF?
+
+ELF = *Executable and Linkable Format*. `gcc` output is an ELF.
+
+```bash
 gcc -g -Wall -Wextra -pedantic -O0 -o dummy_hello_world dummy_hello_world.c
-```
-You will notice a new file in the folder: `dummy_hello_world`. That's our elf file and we can run it with:
-```
 ./dummy_hello_world
 ```
 
-### How does an ELF file look like?
+Two views of the same file:
 
-You can view the file headers of an elf file by running
-```
+| On disk | In memory (when you run it) |
+|---------|-----------------------------|
+| Bytes with a header | The kernel `mmap`s **segments** |
+| You inspect with `readelf` | Addresses may be shifted (PIE / ASLR) |
+
+**Sections** (`.text`, `.data`, names in `readelf -S`) are for the linker
+and debugger. The **kernel only loads program headers** (`readelf -l`),
+especially `PT_LOAD`.
+
+---
+
+## 2. ELF header (`readelf -h`)
+
+```bash
 readelf -h dummy_hello_world
 ```
 
-you will see something like:
-```
-ELF Header:
-  Magic:   7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00
-  Class:                             ELF64
-  Data:                              2's complement, little endian
-  Version:                           1 (current)
-  OS/ABI:                            UNIX - System V
-  ABI Version:                       0
-  Type:                              DYN (Position-Independent Executable file)
-  Machine:                           Advanced Micro Devices X86-64
-  Version:                           0x1
-  Entry point address:               0x1040
-  Start of program headers:          64 (bytes into file)
-  Start of section headers:          14832 (bytes into file)
-  Flags:                             0x0
-  Size of this header:               64 (bytes)
-  Size of program headers:           56 (bytes)
-  Number of program headers:         15
-  Size of section headers:           64 (bytes)
-  Number of section headers:         37
-  Section header string table index: 36
+Useful fields:
+
+| Field | Meaning |
+|-------|---------|
+| `Magic` `7f 45 4c 46` | `\x7fELF` |
+| `Class` | ELF64 |
+| `Type` | `EXEC` = fixed addresses; `DYN` = PIE |
+| `Entry point address` | First instruction. Often `_start`, **not** `main` |
+| `Start of program headers` | `e_phoff` (usually `64`) |
+| `Number of program headers` | `e_phnum` |
+
+On a typical PIE hello:
+
+```text
+Type:                 DYN (Position-Independent Executable file)
+Entry point address:  0x1040
 ```
 
-The most important data here is `Entry point address`, which indicates where the program starts to run.
+`0x1040` is an **ELF virtual address**, not necessarily the runtime
+address. The kernel adds an ASLR base. Our injector also talks in ELF
+vaddrs; we never bake `0x7f…` into the file.
 
-![ELF file layout: headers on disk and how PT_LOAD segments map into process memory](images/elf-layout.svg)
+---
 
-Also you can see the program headers by running
-```
+## 3. Program headers (`readelf -l`)
+
+```bash
 readelf -l dummy_hello_world
 ```
-And you will see something like:
-```
-Elf file type is DYN (Position-Independent Executable file)
-Entry point 0x1040
-There are 15 program headers, starting at offset 64
 
-Program Headers:
-  Type           Offset             VirtAddr           PhysAddr
-                 FileSiz            MemSiz              Flags  Align
-  PHDR           0x0000000000000040 0x0000000000000040 0x0000000000000040
-                 0x0000000000000348 0x0000000000000348  R      0x8
-  INTERP         0x00000000000003ac 0x00000000000003ac 0x00000000000003ac
-                 0x000000000000001c 0x000000000000001c  R      0x1
-      [Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]
-  LOAD           0x0000000000000000 0x0000000000000000 0x0000000000000000
-                 0x0000000000000638 0x0000000000000638  R      0x1000
-  LOAD           0x0000000000001000 0x0000000000001000 0x0000000000001000
-                 0x0000000000000165 0x0000000000000165  R E    0x1000
-  LOAD           0x0000000000002000 0x0000000000002000 0x0000000000002000
-                 0x00000000000001a0 0x00000000000001a0  R      0x1000
-  LOAD           0x0000000000002dd0 0x0000000000003dd0 0x0000000000003dd0
-                 0x0000000000000248 0x0000000000000250  RW     0x1000
-  DYNAMIC        0x0000000000002de0 0x0000000000003de0 0x0000000000003de0
-                 0x00000000000001e0 0x00000000000001e0  RW     0x8
-  NOTE           0x0000000000000388 0x0000000000000388 0x0000000000000388
-                 0x0000000000000024 0x0000000000000024  R      0x4
-  NOTE           0x0000000000002140 0x0000000000002140 0x0000000000002140
-                 0x0000000000000040 0x0000000000000040  R      0x8
-  NOTE           0x0000000000002180 0x0000000000002180 0x0000000000002180
-                 0x0000000000000020 0x0000000000000020  R      0x4
-  GNU_PROPERTY   0x0000000000002140 0x0000000000002140 0x0000000000002140
-                 0x0000000000000040 0x0000000000000040  R      0x8
-  GNU_EH_FRAME   0x0000000000002014 0x0000000000002014 0x0000000000002014
-                 0x0000000000000024 0x0000000000000024  R      0x4
-  GNU_SFRAME     0x00000000000020b8 0x00000000000020b8 0x00000000000020b8
-                 0x0000000000000088 0x0000000000000088  R      0x8
-  GNU_STACK      0x0000000000000000 0x0000000000000000 0x0000000000000000
-                 0x0000000000000000 0x0000000000000000  RW     0x10
-  GNU_RELRO      0x0000000000002dd0 0x0000000000003dd0 0x0000000000003dd0
-                 0x0000000000000230 0x0000000000000230  R      0x1
+Each line is an `Elf64_Phdr` (56 bytes). This is **not** “the number of
+LOADs”. You also get `PHDR`, `INTERP`, `DYNAMIC`, `NOTE`, `GNU_STACK`…
 
- Section to Segment mapping:
-  Segment Sections...
-   00
-   01     .interp
-   02     .note.gnu.build-id .interp .gnu.hash .dynsym .dynstr .gnu.version .gnu.version_r .rela.dyn .rela.plt
-   03     .init .plt .text .fini
-   04     .rodata .eh_frame_hdr .eh_frame .sframe .note.gnu.property .note.ABI-tag
-   05     .init_array .fini_array .dynamic .got .got.plt .data .bss
-   06     .dynamic
-   07     .note.gnu.build-id
-   08     .note.gnu.property
-   09     .note.ABI-tag
-   10     .note.gnu.property
-   11     .eh_frame_hdr
-   12     .sframe
-   13
-   14     .init_array .fini_array .dynamic .got
+For a `PT_LOAD`:
+
+| Field | Meaning |
+|-------|---------|
+| `Offset` | Byte in the **file** |
+| `FileSiz` | How many bytes to copy from the file |
+| `VirtAddr` | ELF virtual address where it should appear |
+| `MemSiz` | Size in RAM (`>= FileSiz`; extra bytes are zeros = `.bss`) |
+| `Flags` | `R`, `W`, `E` (execute) |
+| `Align` | Usually `0x1000` (page) |
+
+Rule the kernel requires:
+
+```text
+VirtAddr % Align  ==  Offset % Align
 ```
 
-In the program headers section you can notice 4 params:
-- Offset: Indicates the offset to the section in the ELF file
-- FileSiz: Indicates the size of the section in the ELF file.
-- VirtAddr: Indicates where will it be located in the virtual address.
-- Memsiz: Indicates how much memory it will occupy.
+`PT_LOAD` + `R E` is the executable segment (`.text`, `_start`). That is
+**not** where we write the stub. We add a **new** `PT_LOAD` after every
+existing mapping.
 
-Also you can check the `LOAD` sections. They are the most important. Especially the one with R E permissions, which is the one that will be executed.
+`PT_PHDR` means: “the program-header **table** lives at this offset /
+vaddr”. `ld.so` uses that, not only `e_phoff` on disk. If you move the
+table and forget `PT_PHDR`, you get:
 
-We also must know that the executable PT_LOAD segment contains the program's binary code.
-
-## How does our injector work then?
-
-### debug functions
-
-We have some functions like
-`void print_ehdr(Elf64_Ehdr ehdr);` which prints the ehdr or file Headers.
-`void print_ph(FILE *f, Elf64_Ehdr ehdr);` which prints the program headers.
-`void print_sh(FILE *f, Elf64_Ehdr ehdr);` Which print the section headers.
-All of them will provide the same value that readelf does.
-You can read the functions to see how we obtain these values.
-
-### How does the main program work?
-
-First we read all the headers.
-
-Then we obtain the last PT_LOAD data.
-
-With that we will be able to add our new LOAD data with our code in the same ELF file!
-Notice how we calculate the address of our new LOAD:
+```text
+Inconsistency detected by ld.so: rtld.c: … l_libname failed
 ```
- uint64_t new_vaddr;
-  if (max_end % p_align == 0) {
-    new_vaddr = max_end;
-  } else {
-    new_vaddr = max_end + p_align - (max_end % p_align);
-  }
 
+---
+
+## 4. PIE vs `-no-pie` (why the stub is RIP-relative)
+
+| | `gcc … -no-pie` | default `gcc` (PIE) |
+|--|-----------------|---------------------|
+| Type | `EXEC` | `DYN` |
+| `_start` in file | e.g. `0x401050` | e.g. `0x1040` |
+| `_start` at runtime | that same number | `ASLR_base + 0x1040` |
+
+An absolute `movabs rax, 0x401050; jmp rax` dies on PIE.
+
+The stub uses:
+
+- `lea rsi, [rip+disp]` for the message (`write`)
+- `jmp rel32` back to `_start`, with `rel32` patched at inject time
+
+```text
+rel32 = old_e_entry - (payload_vaddr + offset_after_jmp)
 ```
-We need to write to the next page, or the program will be broken. The page size is provided by the p_align value.
 
-![Before/after: injecting a new PT_LOAD segment with its own program header table and payload](images/load-injection.svg)
+At runtime the same base is added to both sides; the distance stays valid.
 
-Once we have copied the elf file (we aren't overwriting it, that would be wrong ;)) we can modify that second elf file:
+---
 
-#### Changing the ELF file:
-Check our function:
+## 5. What the injector does
+
+We **copy** the victim (`new_elf_file`). Original file is left alone.
+
+### 5.1 Read the victim
+
+- `Elf64_Ehdr`
+- whole program-header table into `old[]`
+  (`e_phnum` entries — PHDR, INTERP, LOAD, DYNAMIC, …)
+- last occupied ELF vaddr:
+
+```text
+max_end   = max(p_vaddr + p_memsz) over every PT_LOAD
+new_vaddr = max_end rounded up to p_align   # next free page
 ```
-int add_load_phdr(FILE *out, Elf64_Ehdr eh,
-                  Elf64_Phdr *old, int nold,
-                  uint64_t new_vaddr, uint64_t page)
-{
-  const uint64_t table_size = (uint64_t)(nold + 1) * sizeof(Elf64_Phdr);
-  uint64_t table_off = align_offset(out, new_vaddr, page);
 
-  Elf64_Phdr new = {0};
-  new.p_type   = PT_LOAD;
-  new.p_flags  = PF_R | PF_X;
-  new.p_offset = table_off;
-  new.p_vaddr  = new_vaddr;
-  new.p_paddr  = new_vaddr;
-  new.p_filesz = table_size + sizeof(payload);
-  new.p_memsz  = new.p_filesz;
-  new.p_align  = page;
+`new_vaddr` is the **virtual** start of the new segment, not a file
+offset.
 
-  for (int i = 0; i < nold; i++) {
-    if (old[i].p_type == PT_PHDR) {
-      old[i].p_offset = table_off;
-      old[i].p_vaddr  = new_vaddr;
-      old[i].p_paddr  = new_vaddr;
-      old[i].p_filesz = table_size;
-      old[i].p_memsz  = table_size;
-      old[i].p_align  = 8;
-    }
-  }
+### 5.2 Debug helpers
 
-  if (fwrite(old, sizeof(Elf64_Phdr), nold, out) != (size_t)nold)
-    return -1;
-  if (fwrite(&new, sizeof new, 1, out) != 1)
-    return -1;
-  if (fwrite(payload, 1, sizeof(payload), out) != sizeof(payload))
-    return -1;
+`print_ehdr` / `print_ph` / `print_sh` reprint what `readelf` shows.
+Optional.
 
-  eh.e_phoff = (Elf64_Off)table_off;
-  eh.e_phnum = (Elf64_Half)(nold + 1);
-  eh.e_entry = new_vaddr + table_size;
+### 5.3 `add_load_phdr` — the actual patch
 
-  fseek(out, 0, SEEK_SET);
-  if (fwrite(&eh, sizeof eh, 1, out) != 1)
-    return -1;
+Arguments:
 
-  return 0;
-}
+| Arg | Meaning |
+|-----|---------|
+| `out` | the copy, open for update |
+| `eh` | original ELF header (**still** with the old `e_entry`) |
+| `old` | copy of **all** original program headers |
+| `nold` | `e_phnum` (not “number of LOADs”) |
+| `new_vaddr` | free ELF page |
+| `page` | `p_align` (usually `0x1000`) |
 
+**Step A — pad the file**
+
+`align_offset` seeks to EOF and writes `0x00` until
+
+```text
+file_offset % page == new_vaddr % page
 ```
-The args:
-- `out` the new elf file already opened.
-- `eh` the values of the original header
-- `old` array with the original LOADs
-- `nold` number of the original LOADs
-- `new_vaddr` the new virtual address free (the new page)
-- `page` page size
 
-`const uint64_t table_size = (uint64_t)(nold + 1) * sizeof(Elf64_Phdr);` => Size of the new table (nold + 1 LOADs) times the size of a LOAD.
+That offset is `table_off`. It is *not* “fill a whole page every time”.
+It does not write headers; it only aligns.
 
-`align_offset` goes to the end of the file and fills it with 0s until we reach a new page. `table_off` is where the new table will start.
+**Step B — describe the new LOAD**
 
-Then we have the new LOAD section information.
+```text
+p_type   = PT_LOAD
+p_flags  = R | X
+p_offset = table_off          # on disk
+p_vaddr  = new_vaddr          # ELF vaddr
+p_filesz = table_size + payload_size
+p_memsz  = p_filesz
+p_align  = page
 ```
-Elf64_Phdr new = {0};
-new.p_type   = PT_LOAD;
-new.p_flags  = PF_R | PF_X;
-new.p_offset = table_off;
-new.p_vaddr  = new_vaddr;
-new.p_paddr  = new_vaddr;
-new.p_filesz = table_size + sizeof(payload);
-new.p_memsz  = new.p_filesz;
-new.p_align  = page;
+
+One segment covers **new PHDR table + stub**.
+
+```text
+table_size = (nold + 1) * sizeof(Elf64_Phdr)
 ```
-You can see that the flags are `PF_R | PF_X` because we want to execute the injected code. It doesn't matter that the table is executable.
-The offset is the one we just calculated.
-`p_filesz` is the table plus the code payload.
 
-Then we have this code:
+**Step C — retarget `PT_PHDR` inside `old[]`**
+
+```text
+p_offset / p_vaddr = table_off / new_vaddr
+p_filesz           = table_size     # table only, not the stub
 ```
-if (fwrite(old, sizeof(Elf64_Phdr), nold, out) != (size_t)nold)
-    return -1;
-if (fwrite(&new, sizeof new, 1, out) != 1)
-    return -1;
-if (fwrite(payload, 1, sizeof(payload), out) != sizeof(payload))
-    return -1;
+
+So `ld.so` sees the **new** table in memory.
+
+**Step D — write the tail of the file**
+
+```text
+[ zeros ][ old PHDRs (patched) ][ new LOAD phdr ][ payload ]
+           ▲
+           table_off = e_phoff
 ```
-It means that we write the old P_LOADS, the new one and the payload.
-We are already at table_off because we called align_offset.
 
-Finally we need to change some eh data:
+Original `.text` is **not** copied again. Only the 56-byte descriptors
+are duplicated at the end. Old bytes stay in the middle of the file.
+
+**Step E — patch the stub, then the ELF header**
+
+```text
+rel32 patched into jmp
+eh.e_phoff  = table_off
+eh.e_phnum  = nold + 1
+eh.e_entry  = new_vaddr + table_size   # first byte of the stub
 ```
-eh.e_phoff = (Elf64_Off)table_off;
-eh.e_phnum = (Elf64_Half)(nold + 1);
-eh.e_entry = new_vaddr + table_size;
+
+`fwrite` the header at offset `0`.
+
+`e_entry` is **not** `new_vaddr` (that is the table). The CPU must start
+on instructions, after the table.
+
+---
+
+## 6. Pictures
+
+### Original
+
+```text
+FILE                                    MEMORY (example EXEC)
+
+[ ELF hdr  e_phoff=0x40                 LOAD R    header + old PHDRs
+  e_entry=_start ]                      LOAD RE   .text  ← _start
+[ PHDR table @ 0x40 ]                   LOAD RW   .data
+[ .text .data … ]
 ```
-`e_phoff` => `position of the table in the disk`
-`e_phnum` => `Our new LOAD`
-`e_entry` => `Our code is just after the table.`
 
-And then we write it.
+On PIE the same layout uses low vaddrs (`0x0000`, `0x1000`, …) plus ASLR.
 
-## Sumary (Generated with AI)
+### After inject
 
-### Original ELF:
-DISC                                     MEMORY (Execution time)
+```text
+FILE
 
-0x0     ┌─────────────┐                  0x400000 ┌─────────────┐
-        │ ELF header  │                           │ header+PHDR │  LOAD R
-        │ e_phoff=0x40│────────┐                  │ INTERP…     │
-        │ e_entry=    │        │         0x400040 │ PHDRs       │ ← PT_PHDR
-        │   0x401050  │        │                  └─────────────┘
-0x40    ├─────────────┤        │
-        │ PHDRs       │◄───────┘         0x401000  ┌─────────────┐
-        │  PHDR       │── apunta a 0x40 / 0x400040 │ .text       │  LOAD RX
-        │  LOAD R     │                           │ _start      │ ← e_entry
-        │  LOAD RX    │                           └─────────────┘
-        │  LOAD RW    │
-        ├─────────────┤                  0x403df8  ┌─────────────┐
-        │ .text .data │                           │ .data .bss  │  LOAD RW
-        └─────────────┘                           └─────────────┘
+[ ELF hdr  e_phoff=table_off
+           e_entry=new_vaddr+table_size ]
+[ old PHDR table @ 0x40 ]          # leftover, unused as a table
+[ .text .data … ]
+[ padding zeros ]
+[ NEW PHDR table                    ← e_phoff, PT_PHDR
+    copies of old entries
+    + extra PT_LOAD ]
+[ payload: write + jmp rel32 ]      ← e_entry
+```
 
-### Our copy
+```text
+MEMORY
 
-DISC, final opened
+old LOADs unchanged
+new page at new_vaddr:
+    [ PHDR table ][ stub ]
+         ▲              ▲
+      PT_PHDR / ld.so   CPU starts here, then jmp to _start
+```
 
-          padding 00 00 00 …   (para alinear offset con new_vaddr)
+Who points where:
 
-table_off ┌──────────────────────────────────┐
-          │ PHDR                             │
-          │ INTERP                           │
-          │ LOAD R     (copy, same)          │
-          │ LOAD RX    (copy, same)          │
-          │ LOAD RW    (copy, same)          │
-          │ …                                │
-          │ NEW LOAD RX  ← new               │
-          ├──────────────────────────────────┤
-          │ 48 c7 c0 3c … 0f 05   exit(0)    │
-          └──────────────────────────────────┘
+```text
+e_phoff          → table_off          (file)
+e_entry          → new_vaddr + table  (ELF vaddr of stub)
+PT_PHDR.p_offset → table_off
+PT_PHDR.p_vaddr  → new_vaddr
+new LOAD         → same start, longer (table + payload)
+```
 
-The old table still here but it's not useful now.
+You can also keep the repo diagrams:
 
-The payload is in a new page.
+- `images/elf-layout.svg` — headers on disk vs `PT_LOAD` in memory
+- `images/load-injection.svg` — before/after the extra segment
 
-### Who points to that?
-ELF header (offset 0)
-  e_phoff  ──────────────► table_off          (DISC: “table here”)
-  e_phnum  = nold + 1
-  e_entry  ──────────────► new_vaddr + table_size
-                           (RAM: “start execution here!!”)
+---
 
-PT_PHDR (inside new Table)
-  p_offset ──────────────► table_off          (DISCO)
-  p_vaddr  ──────────────► new_vaddr          (RAM)
-  p_filesz = table_size                       (only the table, not the payload)
+## 7. Why `ld.so` needed the `PT_PHDR` patch
 
-LOAD nuevo (at the end of the table)
-  p_offset ──────────────► table_off          (DISC: table + exit)
-  p_vaddr  ──────────────► new_vaddr          (RAM)
-  p_filesz = table_size + sizeof(payload)
-  flags    = R X
+`execve` reads `e_phoff` from **disk** and maps every `PT_LOAD`.
 
-## TODO
+Then the dynamic linker uses the aux vector:
 
-needs to explain the ld.so when i understand it.
+- `AT_PHDR` ← `PT_PHDR.p_vaddr` (table **in RAM**)
+- `AT_PHNUM` ← `e_phnum`
+
+If `e_phnum` is `nold+1` but `PT_PHDR` still points at the old table
+(only `nold` real entries), `ld.so` reads one extra garbage header and
+aborts. Mapping the new table inside the new `PT_LOAD` and updating
+`PT_PHDR` keeps disk, RAM, and `e_phnum` consistent.
+
+---
+
+## 8. Payload (current)
+
+Educational stub:
+
+1. `push` caller-saved regs (`rdx` matters for `atexit`)
+2. `write(1, ">>> Codigo inyectado al arrancar\n", 33)`
+3. `pop`
+4. `jmp rel32` to original `e_entry` (`_start`)
+
+Not libc. No `printf`. Runs before `main`.
+
+---
+
+## 9. Limits
+
+- ELF64 x86-64 Linux only
+- Needs a writable copy of the binary
+- `readelf -l` will show the extra `LOAD` (not stealth)
+- Re-injecting an already patched file will use the wrong `old_entry`
+- IoT is often ARM64: same ELF logic, different stub bytes
+
+---
+
+## 10. Quick check
+
+```bash
+gcc -o dummy_hello_world dummy_hello_world.c
+./elf_injector dummy_hello_world
+readelf -h new_elf_file | grep Entry
+readelf -l new_elf_file          # extra LOAD R E, PHDR offset near EOF
+./new_elf_file
+```
