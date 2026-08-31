@@ -14,8 +14,35 @@ char *machine_name(uint16_t machine);
 void obtain_last_load_data(FILE *f, Elf64_Ehdr ehdr, uint64_t *vaddr_last_load, uint64_t *memsz_last_load, uint64_t *p_align);
 FILE *copy_elf_file(FILE *source_file, char *destination_file_name);
 int patch_entry(FILE *new_file, uint64_t new_vaddr);
+static uint64_t align_offset(FILE *out, uint64_t new_vaddr, uint64_t page);
+int add_load_phdr(FILE *out, Elf64_Ehdr eh,
+                  Elf64_Phdr *old, int nold,
+                  uint64_t new_vaddr, uint64_t page);
 static const char *seg_type_name(uint32_t type);
 static void print_flags(uint32_t flags, char *out);
+
+static uint8_t injected_payload[] = {
+    /* 0*/ 0x50,0x51,0x52,0x56,0x57,0x41,0x50,0x41,0x51,
+    /* 9*/ 0x48,0x8d,0x35,0x2c,0x00,0x00,0x00,
+    /*16*/ 0x48,0xc7,0xc7,0x01,0x00,0x00,0x00,
+    /*23*/ 0x48,0xc7,0xc2,0x21,0x00,0x00,0x00,
+    /*30*/ 0x48,0xc7,0xc0,0x01,0x00,0x00,0x00,
+    /*37*/ 0x0f,0x05,
+    /*39*/ 0x41,0x59,0x41,0x58,0x5f,0x5e,0x5a,0x59,0x58,
+    /*48*/ 0x48,0xb8,
+    /*50*/ 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, /* ← memcpy aquí */
+    /*58*/ 0xff,0xe0,
+    /*60*/ '>','>','>',' ','C','o','d','i','g','o',' ',
+           'i','n','y','e','c','t','a','d','o',' ','a','l',' ',
+           'a','r','r','a','n','c','a','r','\n'
+};
+
+struct inject_off {
+  uint64_t table_off;   /* e_phoff / p_offset del LOAD nuevo */
+  uint64_t payload_off; /* donde están las instrucciones */
+};
+
+#define OFF_OLD_ENTRY 50   /* primer byte del inmediato de 8 */
 
 int main(int argc, char **argv) {
   if (argc != 2) {
@@ -72,11 +99,23 @@ int main(int argc, char **argv) {
   printf("max_end => 0x%lx\n", max_end);
   printf("new_vaddr => 0x%lx\n", new_vaddr);
 
-  FILE *new_file;
-  new_file = copy_elf_file(f, "new_elf_file");
+  Elf64_Phdr *old = malloc((size_t)ehdr.e_phnum * sizeof(*old));
+  fseek(f, (long)ehdr.e_phoff, SEEK_SET);
+  fread(old, sizeof(*old), ehdr.e_phnum, f);
 
-  patch_entry(new_file, new_vaddr);
+  // ehdr.e_entry = new_vaddr;
 
+  FILE *new_file = copy_elf_file(f, "new_elf_file");
+  if (!new_file)
+      return 1;
+
+  if (add_load_phdr(new_file, ehdr, old, ehdr.e_phnum, new_vaddr, p_align) != 0) {
+    printf("Error adding PT_LOAD\n");
+    return 1;
+  }
+
+
+  free(old);
   fclose(f);
   fclose(new_file);
   return 0;
@@ -270,4 +309,75 @@ int patch_entry(FILE *new_file, uint64_t new_vaddr)
 
   fflush(new_file);
   return 0;
+}
+
+int add_load_phdr(FILE *out, Elf64_Ehdr eh,
+                  Elf64_Phdr *old, int nold,
+                  uint64_t new_vaddr, uint64_t page)
+{
+  const uint64_t table_size = (uint64_t)(nold + 1) * sizeof(Elf64_Phdr);
+  uint64_t table_off = align_offset(out, new_vaddr, page);
+
+  Elf64_Phdr new = {0};
+  new.p_type   = PT_LOAD;
+  new.p_flags  = PF_R | PF_X;
+  new.p_offset = table_off;
+  new.p_vaddr  = new_vaddr;
+  new.p_paddr  = new_vaddr;
+  new.p_filesz = table_size + sizeof(injected_payload);
+  new.p_memsz  = new.p_filesz;
+  new.p_align  = page;
+
+  for (int i = 0; i < nold; i++) {
+    if (old[i].p_type == PT_PHDR) {
+      old[i].p_offset = table_off;
+      old[i].p_vaddr  = new_vaddr;
+      old[i].p_paddr  = new_vaddr;
+      old[i].p_filesz = table_size;
+      old[i].p_memsz  = table_size;
+      old[i].p_align  = 8;
+    }
+  }
+
+  if (fwrite(old, sizeof(Elf64_Phdr), nold, out) != (size_t)nold) {
+    printf("ERROR fwrite old phdrs\n");
+    return -1;
+  }
+  if (fwrite(&new, sizeof new, 1, out) != 1) {
+    printf("ERROR fwrite new\n");
+    return -1;
+  }
+
+  uint64_t old_entry = eh.e_entry;
+  printf("jmp a 0x%lx\n", (unsigned long)old_entry);
+  memcpy(injected_payload + 50, &old_entry, 8);
+  if (fwrite(injected_payload, 1, sizeof(injected_payload), out) != sizeof(injected_payload)) {
+    printf("ERROR fwrite payload\n");
+    return -1;
+  }
+
+  eh.e_phoff = (Elf64_Off)table_off;
+  eh.e_phnum = (Elf64_Half)(nold + 1);
+  eh.e_entry = new_vaddr + table_size;
+
+  fseek(out, 0, SEEK_SET);
+  if (fwrite(&eh, sizeof eh, 1, out) != 1) {
+    printf("Error write ehdr");
+    return -1;
+  }
+
+
+  return 0;
+}
+
+// Copy the P_LOADs in the bottom and we must change ph_off
+static uint64_t align_offset(FILE *out, uint64_t new_vaddr, uint64_t page)
+{
+  fseek(out, 0, SEEK_END);
+  uint64_t off = (uint64_t)ftell(out);
+  while ((off % page) != (new_vaddr % page)) {
+    fputc(0, out);
+    off++;
+  }
+  return off;
 }
